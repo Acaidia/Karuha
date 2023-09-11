@@ -1,24 +1,32 @@
 import asyncio
 import builtins
-from typing import Literal, Optional
-from .message import Message, Event
+from typing import List, NoReturn, Optional
+
+from .event import Event, EventMode
 
 
 class Exception(Event):
-    __slots__ = ["text"]
+    __slots__ = ["text", "src_node", "src_message", "traceback"]
+
+    mode = EventMode.PROPAGATE
 
     def __init__(self, text: str, /) -> None:
         super().__init__()
         self.text = text
+        self.src_node = get_curr_node()
+        self.src_message = get_curr_message()
+        self.traceback: List["Network"] = []
+    
+    def throw(self) -> NoReturn:
+        self.send()
+        raise NodeCancelledError(exc=self)
 
 
 class PortError(Exception):
-    __slots__ = ["action", "name", "node"]
+    __slots__ = ["name"]
 
-    def __init__(self, text: str, /, node: "BaseNode", action: Literal["READ", "WRITE"], name: str) -> None:
+    def __init__(self, text: str, /, name: str) -> None:
         super().__init__(text)
-        self.node = node
-        self.action = action
         self.name = name
 
 
@@ -27,11 +35,11 @@ class ValueError(Exception):
 
 
 class UnsupportedMessageError(Exception):
-    __slots__ = ["message"]
+    __slots__ = []
 
-    def __init__(self, text: str, /, message: Message) -> None:
-        super().__init__(text)
-        self.message = message
+
+class RuntimeError(Exception):
+    __slots__ = []
 
 
 class PyKernelError(Exception):
@@ -50,4 +58,5 @@ class NodeCancelledError(asyncio.CancelledError):
         self.exc_message = exc
 
 
-from .node import BaseNode
+from .node import get_curr_node, get_curr_message
+from .network import Network

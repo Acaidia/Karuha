@@ -1,17 +1,16 @@
-import asyncio
-from typing import List, NamedTuple, Optional, Set, Type, TypeVar, Union
+from collections import defaultdict
+from contextvars import ContextVar
+from typing import List, Literal, NamedTuple, NoReturn, Optional, Protocol, Set, Type, TypeVar, Union, overload
 
-from .message import Event, Message
-from .node import BaseNode, HandlerFlag, Node, AbstractPort, PortFlag, on
+from . import message as kes_msg
+from . import event as kes_evt
 from . import exception as kes_exc
+from .node import BaseNode, HandlerFlag, Node, AbstractPort, PortFlag, on
+from .record import AbstractRecordManager, RecordLike, RecordManager
 
 
 T_Node = TypeVar("T_Node", bound=BaseNode)
-
-
-class NodeRecord(NamedTuple):
-    node: BaseNode
-    next: Set[int]
+cur_msg = ContextVar("cur_msg", default=None)
 
 
 class RecordPort(AbstractPort):
@@ -25,41 +24,133 @@ class RecordPort(AbstractPort):
     
     def get(self, /) -> BaseNode:
         super().get()
-        return self.node.records[self.nid].node
+        return self.node.records.get(self.nid).node
     
     def set(self, node: BaseNode, /) -> None:
         node.throw(
             kes_exc.PortError(
                 "cannot write to node record",
-                node, "WRITE", self.name
+                self.name
             )
         )
 
 
 class Network(Node):
-    __slots__ = ["records", "event_map"]
+    __slots__ = ["records", "event_map", "stopping"]
 
-    def __init__(self, net: "Network", id: int) -> None:
-        super().__init__(net, id)
-        self.records: List[NodeRecord] = []
-        self.event_map = {}
+    records: AbstractRecordManager
+
+    def __init__(self, net: "Network") -> None:
+        super().__init__(net)
+        self.records = RecordManager()
+        self.event_map = defaultdict(list)
+        self.stopping = False
     
-    def node_new(self, node: Type[T_Node], *args, **kwds) -> T_Node:
-        node_ins = node(self, len(self.records), *args, **kwds)
-        self.records.append(NodeRecord(node_ins, set()))
+    def node_new(self, type: Type[BaseNode], *args, **kwds) -> None:
+        self.send_event_inner(
+            kes_evt.NodeNewEvent(type, *args, **kwds)
+        )
+    
+    def node_drop(self, nid: int) -> None:
+        self.send_event_inner(
+            kes_evt.NodeDropEvent(nid)
+        )
+    
+    @on(kes_msg.NodeInitializeMessage)
+    def on_initialize(self, message: kes_msg.NodeInitializeMessage) -> None:
+        self.send_event_inner(kes_evt.NetworkInitEvent())
+    
+    @on(kes_msg.NodeFinalizeMessage)
+    def on_finalize(self, message: kes_msg.NodeFinalizeMessage) -> None:
+        self.send_event_inner(kes_evt.NetworkFinalizeEvent())
+    
+    @on(kes_evt.Event)
+    def on_event(self, event: kes_evt.Event) -> None:
+        handled = False
+        for tp in event.__class__.__mro__:
+            if tp not in self.event_map:
+                continue
+            handled = True
+            for i in self.event_map[tp]:
+                self.send_message(i, event)
+        if (not handled and kes_evt.EventMode.PROPAGATE == event.mode) or kes_evt.EventMode.FORCE_PROPAGATE == event.mode:
+            return self.send_event(event)
+        elif not handled and kes_evt.EventMode.THROW_ERR == event.mode:
+            self.throw(kes_exc.UnsupportedMessageError(f"unsupported event {event}"))
+    
+    @on(kes_evt.NodeNewEvent, flag=HandlerFlag.PROPAGATE)
+    def on_node_new(self, event: kes_evt.NodeNewEvent) -> None:
+        if self.stopping:
+            kes_exc.RuntimeError("cannot alloc node when the network was stopping").throw()
+        node = self._node_alloc(event.type, *event.args, **event.kwargs)
+        node.send_message(node, kes_msg.NodeInitializeMessage())
+    
+    @on(kes_evt.NodeDropEvent, flag=HandlerFlag.PROPAGATE)
+    def on_node_drop(self, event: kes_evt.NodeDropEvent) -> None:
+        self._node_dealloc(event.nid, disconnect=True)
+        if self.stopping and not self.records:
+            self.drop()
+    
+    @on(kes_evt.NodeTransferEvent, flag=HandlerFlag.PROPAGATE)
+    def on_node_transfer(self, event: kes_evt.NodeTransferEvent) -> None:
+        node = event.node
+        self._node_receive(node)
+    
+    @on(kes_evt.NetworkFinalizeEvent, flag=HandlerFlag.PROPAGATE)
+    def on_net_finalize(self, event: kes_evt.NetworkFinalizeEvent) -> None:
+        self.stopping = True
+        if not self.records:
+            self.drop()
+            return
+        for i in self.records:
+            self.send_message(i.node, kes_msg.NodeFinalizeMessage())
+
+    def send_event_inner(self, event: kes_evt.Event) -> None:
+        self.send_message_inner(event)
+    
+    @overload
+    def throw_inner(self, exception: "kes_exc.Exception", *, cancel: Literal[False]) -> None: ...
+    @overload
+    def throw_inner(self, exception: "kes_exc.Exception", *, cancel: Literal[True] = True) -> NoReturn: ...
+
+    def throw_inner(self, exception: "kes_exc.Exception", *, cancel: bool = True) -> None:
+        self.send_message(self, exception)
+        if cancel:
+            raise kes_exc.NodeCancelledError(exc=exception)
+    
+    send_exception_inner = throw_inner
+
+    def _node_alloc(self, node: Type[T_Node], *args, **kwds) -> T_Node:
+        node_ins = node(self, *args, **kwds)
+        nid = self.records.new(node_ins)
+        node_ins.nid = nid
         return node_ins
     
-    def node_del(self, nid: int, *, disconnect: bool = False) -> None:
+    def _node_dealloc(self, nid: int, *, disconnect: bool = False) -> None:
         if disconnect:
             for i in self.records:
                 i.next.discard(nid)
-        self._get_record(nid)
-        del self.records[nid]
+        self._node_transfer(nid, get_phantom_net())
     
-    def node_next(self, nid: int) -> List[BaseNode]:
-        return [self._get_record(i).node for i in self._get_record(nid).next]
+    def _node_transfer(self, nid: int, target: "Network") -> None:
+        node = self.records.drop(nid)
+        self.send_message(
+            target,
+            kes_evt.NodeTransferEvent(node)
+        )
     
-    def export(
+    def _node_receive(self, node: BaseNode) -> None:
+        nid = self.records.new(node)
+        node.net = self
+        node.nid = nid
+    
+    def _record_next(self, nid: int) -> List[BaseNode]:
+        return [self.records.get(i).node for i in self.records.get(nid).next]
+    
+    def _connect(self, s_id: int, t_id: int) -> None:
+        self.records.get(s_id).next.add(t_id)
+    
+    def _export(
             self,
             name_or_port: Union[str, AbstractPort],
             /,
@@ -69,24 +160,21 @@ class Network(Node):
         if nid is not None:
             assert isinstance(name_or_port, str)
             name_or_port = RecordPort(self, name_or_port, nid, flag)
-        return super().export(name_or_port, flag)
+        return super()._export(name_or_port, flag)
     
-    def connect(self, s_id: int, t_id: int) -> None:
-        self._get_record(s_id).next.add(t_id)
+    def _register_event(self, event: Type[kes_evt.Event], node: BaseNode) -> None:
+        self.event_map[event].append(node)
     
-    def send_message(self, node: BaseNode, message: Message) -> None:
-        asyncio.create_task(node.handle_message(message))
+    def _unregister_event(self, event: Type[kes_evt.Event], node: BaseNode) -> None:
+        if node not in self.event_map[event]:
+            self.throw_inner(
+                kes_exc.ValueError(f"unregistered node {node}")
+            )
+        self.event_map[event].remove(node)
     
-    @on(Event, flag=HandlerFlag(0))
-    def on_event(self, event: Event) -> None:
-        if event not in self.event_map:
-            return self.send_message(self.net, event)
-        for i in self.event_map[event]:
-            self.send_message(i, event)
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__qualname__} net in net {self.net!r} at 0x{id(self):#016X}>"
 
-    def _get_record(self, nid: int, /) -> NodeRecord:
-        if nid < 0 or nid >= len(self.records):
-            err = kes_exc.ValueError(f"index {nid} out of range")
-            self.send_message(self, err)
-            raise kes_exc.NodeCancelledError(exc=err)
-        return self.records[nid]
+
+from .phantom import get_phantom_net, set_phantom_net
+    

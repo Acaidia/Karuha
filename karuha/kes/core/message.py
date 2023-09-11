@@ -1,4 +1,3 @@
-import asyncio
 from typing import Any
 from typing_extensions import Self
 
@@ -7,8 +6,11 @@ class Message(object):
     __slots__ = []
 
     def __rshift__(self, node: "BaseNode") -> Self:
-        asyncio.create_task(node.handle_message(self))
+        get_curr_node().send_message(node, self)
         return self
+    
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__qualname__} messge>"
 
 
 class DataMessage(Message):
@@ -17,7 +19,18 @@ class DataMessage(Message):
     def __init__(self, /, data: Any) -> None:
         super().__init__()
         self.data = data
-    
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__qualname__} messge with data {self.data!r}>"
+
+
+class NodeInitializeMessage(Message):
+    __slots__ = []
+
+
+class NodeFinalizeMessage(Message):
+    __slots__ = []
+
 
 class ReflectMessage(Message):
     __slots__ = ["target", "raw"]
@@ -26,20 +39,26 @@ class ReflectMessage(Message):
         super().__init__()
         self.target = target
         self.raw = message
+    
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__qualname__} messge with {self.raw!r} from {self.target!r}>"
 
 
-class PortMessage(Message):
+class PortAction(Message):
     __slots__ = ["name"]
 
     def __init__(self, /, name: str) -> None:
         self.name = name
+    
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__qualname__} messge for port {self.name!r}>"
 
 
-class PortGet(PortMessage):
+class PortGet(PortAction):
     __slots__ = []
 
 
-class PortSet(PortMessage):
+class PortSet(PortAction):
     __slots__ = ["value"]
 
     def __init__(self, /, name: str, value: Any) -> None:
@@ -47,8 +66,8 @@ class PortSet(PortMessage):
         self.value = value
 
 
-class Event(Message):
+class PortExportAttr(PortAction):
     __slots__ = []
 
 
-from .node import BaseNode
+from .node import BaseNode, get_curr_node
