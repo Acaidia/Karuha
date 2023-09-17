@@ -1,5 +1,7 @@
+from copy import copy
 from enum import Enum, auto
-from typing import Any, ClassVar, List, Type
+from typing import Any, ClassVar, Tuple, Type
+from typing_extensions import Self
 
 from .message import Message
 
@@ -18,19 +20,25 @@ class Event(Message):
 
     def __init__(self) -> None:
         super().__init__()
-        self.traceback: List["Network"] = []
+        self.traceback: Tuple["Network", ...] = ()
 
     def send(self) -> None:
         get_curr_node().send_event(self)
     
-    def add_traceback(self, net: "Network") -> None:
-        self.traceback.append(net)
+    def add_traceback(self, net: "Network") -> Self:
+        ne = copy(self)
+        ne.traceback = self.traceback + (net,)
+        return ne
+    
+    @property
+    def is_primary(self) -> bool:
+        return not self.traceback
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__qualname__} event>"
 
 
-class NetworkInitEvent(Event):
+class NetworkInitializeEvent(Event):
     __slots__ = []
 
 

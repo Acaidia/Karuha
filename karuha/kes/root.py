@@ -3,7 +3,8 @@ import asyncio
 from ..logger import logger
 from .core import kes_msg, kes_evt, kes_exc
 from .core.node import on
-from .core.root import RootNetwork, set_root_net, get_root_net  # noqa
+from .builtin.root import RootNetwork, get_root_net  # noqa
+from .builtin.root import set_root_net as _set_root_net
 
 
 class KESRootNetwork(RootNetwork):
@@ -16,11 +17,17 @@ class KESRootNetwork(RootNetwork):
 
     @on(kes_exc.Event)
     async def on_event(self, event: kes_exc.Event) -> None:
-        if event not in self.event_map:
-            logger.warn(f"unhandled event {event!r}")
+        if event not in self.event_map and event.mode == kes_evt.EventMode.THROW_ERR:
+            logger.warning(f"unhandled event {event!r}")
         else:
             await super().on_event(event)
 
 
 root_net = KESRootNetwork()
-set_root_net(root_net)
+_set_root_net(root_net)
+
+
+def set_root_net(net: KESRootNetwork) -> None:
+    global root_net
+    _set_root_net(net)
+    root_net = net

@@ -40,7 +40,6 @@ class NodeRecord(NamedTuple):
     next: Set[int]
 
 
-
 class RecordManager(AbstractRecordManager):
     __slots__ = ["_records", "_id_cache"]
 

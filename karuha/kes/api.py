@@ -1,19 +1,14 @@
-from typing import Optional, Type
-
-from .core import BaseNode, Network, kes_msg
-from .root import get_root, set_root
+from .core import kes_msg
+from .root import get_root_net
 
 
-def kes_init(root: Optional[Network] = None) -> None:
-    if root is not None:
-        set_root(root)
-    else:
-        root = get_root()
+def kes_init() -> None:
+    root = get_root_net()
     root.send_message(root, kes_msg.NodeInitializeMessage())
 
 
 def kes_finalize(*, force: bool = False) -> None:
-    root = get_root()
+    root = get_root_net()
     if force:
         root.drop()
     else:

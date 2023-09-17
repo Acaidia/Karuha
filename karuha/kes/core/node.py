@@ -1,6 +1,6 @@
 import asyncio
 from abc import ABC, abstractmethod
-from asyncio import iscoroutine
+from asyncio import iscoroutinefunction
 from contextlib import suppress
 from contextvars import ContextVar
 from enum import IntFlag, auto
@@ -28,7 +28,7 @@ async def prepare_and_exec(node: "BaseNode", message: Message) -> None:
     var_node.set(node)
     var_message.set(message)
     try:
-        await node.handle_message(message)
+        await node.__handle_message__(message)
     except Exception as e:
         raise kes_exc.NodeCancelledError(
             "uncaught exception",
@@ -56,7 +56,7 @@ class BaseNode(object):
     net: "Network"
     nid: int
 
-    def __init__(self, net: "Network") -> None:
+    def __init__(self, net: "Network", /) -> None:
         self.net = net
     
     @staticmethod
@@ -85,13 +85,13 @@ class BaseNode(object):
     
     send_exception = throw
 
-    async def handle_message(self, message: "Message", /) -> None:
+    async def __handle_message__(self, message: "Message", /) -> None:
         self.throw(
             kes_exc.UnsupportedMessageError("unprocessable message")
         )
     
     def __repr__(self) -> str:
-        return f"<{self.__class__.__qualname__} node in net {self.net!r} at 0x{id(self):#016X}>"
+        return f"<{self.__class__.__qualname__} node in net {self.net!r} at 0x{id(self):016X}>"
 
 
 class PortFlag(IntFlag):
@@ -203,7 +203,7 @@ class MessageHandler(Generic[T_Message]):
     
     async def __call__(self, node: "Node", message: T_Message) -> Any:
         ret = self.__func__(node, message)
-        if iscoroutine(ret):
+        if iscoroutinefunction(self.__func__):
             ret = await ret
         return ret
 
@@ -233,7 +233,7 @@ class Node(BaseNode):
     __export_attr__: ClassVar[Set[str]] = set()
     __message_handler__: ClassVar[Dict[Type[Message], MessageHandler]]
 
-    def __init__(self, net: "Network") -> None:
+    def __init__(self, net: "Network", /) -> None:
         self.net = net
         self.port_map: Dict[str, AbstractPort] = {i: AttrPort(self, i) for i in self.__export_attr__}
     
@@ -246,17 +246,19 @@ class Node(BaseNode):
     def drop(self) -> None:
         self.send_event(NodeDropEvent(self.nid))
 
-    async def handle_message(self, message: "Message", /) -> None:
-        if isinstance(self.net, PhantomNetwork):
+    async def __handle_message__(self, message: "Message", /, *, raise_for_unsupported: bool = True) -> None:
+        if self.net is network.phantom_net_factory():
             self.throw(kes_exc.RuntimeError("phantom node does not receive messages"))
-            
+        
         if isinstance(message, ReflectMessage):
             target = message.target
             message = message.raw
         else:
             target = None
-        handled = False
+        handled = not raise_for_unsupported
         for tp in message.__class__.__mro__:
+            if tp is object:
+                break
             hdl = self.__message_handler__.get(tp)
             if hdl is None:
                 continue
@@ -335,11 +337,11 @@ class Node(BaseNode):
             if isinstance(i, MessageHandler):
                 cls.__message_handler__[i.message_type] = i
         for k, v in cls.__annotations__.items():
-            if v == Export or (isinstance(v, _AnnotatedAlias) and v.__metadata__ == (AttrPort,)):
+            if v == Export or (isinstance(v, _AnnotatedAlias) and v.__metadata__ == (AttrPort[T_co],)):  # type: ignore
                 cls.__export_attr__.add(k)
 
 
 from . import exception as kes_exc
 from .event import Event, NodeDropEvent
+from . import network
 from .network import Network
-from .phantom import PhantomNetwork

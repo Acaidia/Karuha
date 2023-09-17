@@ -1,16 +1,18 @@
+import gc
 from collections import defaultdict
-from contextvars import ContextVar
-from typing import List, Literal, NamedTuple, NoReturn, Optional, Protocol, Set, Type, TypeVar, Union, overload
+from contextlib import suppress
+from typing import (List, Literal, NoReturn, Optional, Type, TypeVar, Union,
+                    overload)
+from weakref import ref
 
-from . import message as kes_msg
 from . import event as kes_evt
 from . import exception as kes_exc
-from .node import BaseNode, HandlerFlag, Node, AbstractPort, PortFlag, on
-from .record import AbstractRecordManager, RecordLike, RecordManager
+from . import message as kes_msg
+from .node import AbstractPort, BaseNode, HandlerFlag, Node, PortFlag, on
+from .record import AbstractRecordManager, RecordManager
 
 
 T_Node = TypeVar("T_Node", bound=BaseNode)
-cur_msg = ContextVar("cur_msg", default=None)
 
 
 class RecordPort(AbstractPort):
@@ -58,7 +60,7 @@ class Network(Node):
     
     @on(kes_msg.NodeInitializeMessage)
     def on_initialize(self, message: kes_msg.NodeInitializeMessage) -> None:
-        self.send_event_inner(kes_evt.NetworkInitEvent())
+        self.send_event_inner(kes_evt.NetworkInitializeEvent())
     
     @on(kes_msg.NodeFinalizeMessage)
     def on_finalize(self, message: kes_msg.NodeFinalizeMessage) -> None:
@@ -67,12 +69,13 @@ class Network(Node):
     @on(kes_evt.Event)
     def on_event(self, event: kes_evt.Event) -> None:
         handled = False
+        e = event.add_traceback(self)
         for tp in event.__class__.__mro__:
             if tp not in self.event_map:
                 continue
             handled = True
             for i in self.event_map[tp]:
-                self.send_message(i, event)
+                self.send_message(i, e)
         if (not handled and kes_evt.EventMode.PROPAGATE == event.mode) or kes_evt.EventMode.FORCE_PROPAGATE == event.mode:
             return self.send_event(event)
         elif not handled and kes_evt.EventMode.THROW_ERR == event.mode:
@@ -95,6 +98,11 @@ class Network(Node):
     def on_node_transfer(self, event: kes_evt.NodeTransferEvent) -> None:
         node = event.node
         self._node_receive(node)
+    
+    @on(kes_evt.NetworkInitializeEvent, flag=HandlerFlag.PROPAGATE)
+    def on_net_initialize(self, event: kes_evt.NetworkInitializeEvent) -> None:
+        for i in self.records:
+            i.node.send_message_inner(kes_msg.NodeInitializeMessage())
     
     @on(kes_evt.NetworkFinalizeEvent, flag=HandlerFlag.PROPAGATE)
     def on_net_finalize(self, event: kes_evt.NetworkFinalizeEvent) -> None:
@@ -129,8 +137,18 @@ class Network(Node):
     def _node_dealloc(self, nid: int, *, disconnect: bool = False) -> None:
         if disconnect:
             for i in self.records:
-                i.next.discard(nid)
-        self._node_transfer(nid, get_phantom_net())
+                with suppress(kes_exc.NodeCancelledError):
+                    i.next.discard(nid)
+        phantom_net = phantom_net_factory()
+        if phantom_net is not None:
+            self._node_transfer(nid, phantom_net)
+            return
+        n_ref = ref(self.records.drop(nid))
+        gc.collect()
+        if (node := n_ref) is not None:
+            self.throw_inner(
+                kes_exc.RuntimeError(f"the node {node!r} has additional references and cannot be released")
+            )
     
     def _node_transfer(self, nid: int, target: "Network") -> None:
         node = self.records.drop(nid)
@@ -173,8 +191,9 @@ class Network(Node):
         self.event_map[event].remove(node)
     
     def __repr__(self) -> str:
-        return f"<{self.__class__.__qualname__} net in net {self.net!r} at 0x{id(self):#016X}>"
+        return f"<{self.__class__.__qualname__} net in net {self.net!r} at 0x{id(self):016X}>"
 
 
-from .phantom import get_phantom_net, set_phantom_net
+def phantom_net_factory() -> Optional[Network]:
+    return
     
